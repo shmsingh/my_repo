@@ -1,0 +1,171 @@
+diff --git a/host/core.c b/host/core.c
+index 11f13c4..dc78127 100644
+--- a/host/core.c
++++ b/host/core.c
+@@ -21,6 +21,7 @@
+ #include <linux/nvme_ioctl.h>
+ #include <linux/pm_qos.h>
+ #include <asm/unaligned.h>
++#include <linux/proc_fs.h>
+ 
+ #include "nvme.h"
+ #include "fabrics.h"
+@@ -30,6 +31,9 @@
+ 
+ #define NVME_MINORS		(1U << MINORBITS)
+ 
++unsigned int should_timeout = 0;
++EXPORT_SYMBOL(should_timeout);
++
+ unsigned int admin_timeout = 60;
+ module_param(admin_timeout, uint, 0644);
+ MODULE_PARM_DESC(admin_timeout, "timeout in seconds for admin commands");
+@@ -4796,6 +4801,43 @@ static inline void _nvme_check_size(void)
+ 	BUILD_BUG_ON(sizeof(struct nvme_directive_cmd) != 64);
+ }
+ 
++static ssize_t nvme_timeout_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
++{
++	if (*offset > 0)
++		return 0;
++
++	pr_info("Value is : %d\n", should_timeout);
++
++	return -1;
++}
++
++static ssize_t nvme_timeout_write(struct file *file, const char __user *buf, size_t len, loff_t *offset)
++{
++	char lbuf[34];
++	long val = 0;
++	int rc;
++	if(copy_from_user(lbuf, buf, len))
++                return -EFAULT;
++	lbuf[len+1] = '\0';
++        pr_info("lbuf = %s, len = %ld\n", lbuf, len);
++	rc = kstrtol(lbuf, 10, &val);
++        pr_info("val = %ld\n", val);
++	should_timeout = val;
++	return -1;
++}
++
++static const struct file_operations nvme_timeout_ops = {
++        .owner          = THIS_MODULE,
++        .read           = nvme_timeout_read,
++        .write           = nvme_timeout_write,
++};
++
++static int init_timeout_proc(void)
++{
++	pr_info("Timeout proc create\n");
++        proc_create("nvme_induce_io_timeout", 0666, NULL, &nvme_timeout_ops);
++        return 0;
++}
+ 
+ static int __init nvme_core_init(void)
+ {
+@@ -4834,6 +4876,8 @@ static int __init nvme_core_init(void)
+ 		result = PTR_ERR(nvme_subsys_class);
+ 		goto destroy_class;
+ 	}
++
++	init_timeout_proc();
+ 	return 0;
+ 
+ destroy_class:
+@@ -4852,6 +4896,7 @@ out:
+ 
+ static void __exit nvme_core_exit(void)
+ {
++	remove_proc_entry("nvme_induce_io_timeout", NULL);
+ 	class_destroy(nvme_subsys_class);
+ 	class_destroy(nvme_class);
+ 	unregister_chrdev_region(nvme_chr_devt, NVME_MINORS);
+diff --git a/host/nvme.h b/host/nvme.h
+index 80b4fdd..5e4369e 100644
+--- a/host/nvme.h
++++ b/host/nvme.h
+@@ -20,6 +20,7 @@
+ 
+ #include <trace/events/block.h>
+ 
++extern unsigned int should_timeout;
+ extern unsigned int nvme_io_timeout;
+ #define NVME_IO_TIMEOUT	(nvme_io_timeout * HZ)
+ 
+@@ -562,9 +563,26 @@ static inline bool nvme_try_complete_req(struct request *req, __le16 status,
+ 		union nvme_result result)
+ {
+ 	struct nvme_request *rq = nvme_req(req);
+-
++	struct gendisk *disk = req->rq_disk;
++	char temp[50] = "nvme0n1";
++	char disk_name[50] = "";
+ 	rq->status = le16_to_cpu(status) >> 1;
+ 	rq->result = result;
++        if (should_timeout) {
++		if (disk && (disk->disk_name != NULL))
++			strncpy(disk_name, disk->disk_name, strlen(temp));
++		if (!strncmp(temp, disk_name, strlen(temp))) {
++			pr_info("Inducing timeout Disk: %s, I/O %d QID %d\n", disk_name, req->tag, nvme_req_qid(req));
++		 	blk_queue_flag_set(QUEUE_FLAG_FAIL_IO, req->q);	
++        	        rq->status = NVME_SC_HOST_ABORTED_CMD; 
++                	rq->result = result;
++	       		return true;
++		}
++	} else {
++                rq->status = le16_to_cpu(status) >> 1;
++                rq->result = result;
++        }
++
+ 	/* inject error when permitted by fault injection framework */
+ 	nvme_should_fail(req);
+ 	if (unlikely(blk_should_fake_timeout(req->q)))
+diff --git a/host/pci.c b/host/pci.c
+index 8e4e6b5..bc5a6d6 100644
+--- a/host/pci.c
++++ b/host/pci.c
+@@ -1289,8 +1289,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 
+ 	if (blk_mq_request_completed(req)) {
+ 		dev_warn(dev->ctrl.device,
+-			 "I/O %d QID %d timeout, completion polled\n",
+-			 req->tag, nvmeq->qid);
++			 "%s: I/O %d QID %d timeout, completion polled\n",
++			 req->rq_disk->disk_name, req->tag, nvmeq->qid);
+ 		return BLK_EH_DONE;
+ 	}
+ 
+@@ -1306,8 +1306,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 		/* fall through */
+ 	case NVME_CTRL_DELETING:
+ 		dev_warn_ratelimited(dev->ctrl.device,
+-			 "I/O %d QID %d timeout, disable controller\n",
+-			 req->tag, nvmeq->qid);
++			 "%s: I/O %d QID %d timeout, disable controller\n",
++			 req->rq_disk->disk_name,req->tag, nvmeq->qid);
+ 		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+ 		nvme_dev_disable(dev, true);
+ 		return BLK_EH_DONE;
+@@ -1324,8 +1324,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 	 */
+ 	if (!nvmeq->qid || iod->aborted) {
+ 		dev_warn(dev->ctrl.device,
+-			 "I/O %d QID %d timeout, reset controller\n",
+-			 req->tag, nvmeq->qid);
++			 "%s: I/O %d QID %d timeout, reset controller\n",
++			 req->rq_disk->disk_name, req->tag, nvmeq->qid);
+ 		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+ 		nvme_dev_disable(dev, false);
+ 		nvme_reset_ctrl(&dev->ctrl);
+@@ -1345,8 +1345,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+ 
+ 	dev_warn(nvmeq->dev->ctrl.device,
+-		"I/O %d QID %d timeout, aborting\n",
+-		 req->tag, nvmeq->qid);
++		"%s: I/O %d QID %d timeout, aborting\n",
++		 req->rq_disk->disk_name, req->tag, nvmeq->qid);
+ 
+ 	abort_req = nvme_alloc_request(dev->ctrl.admin_q, &cmd,
+ 			BLK_MQ_REQ_NOWAIT, NVME_QID_ANY);
