@@ -1,0 +1,111 @@
+From fef7164c1f972fed1f49030103a2c87456e083ca Mon Sep 17 00:00:00 2001
+From: Shminderjit Singh <shminderjit.singh@oracle.com>
+Date: Tue, 6 May 2025 10:56:02 +0000
+Subject: [scsi_queue.d env: requeue every other command 1/1] Requeue every
+ other scsi request.
+
+Signed-off-by: Shminderjit Singh <shminderjit.singh@oracle.com>
+---
+ block/genhd.c           | 41 +++++++++++++++++++++++++++++++++++++++++
+ drivers/scsi/scsi_lib.c | 18 ++++++++++++++++--
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/block/genhd.c b/block/genhd.c
+index d824b903bc84..e66057738f52 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1266,10 +1266,51 @@ static const struct seq_operations diskstats_op = {
+ 	.show	= diskstats_show
+ };
+ 
++int toggle_init = 0;
++EXPORT_SYMBOL(toggle_init);
++
++static ssize_t toggle_init_read(struct file *file, char __user *ubuf,
++                          size_t count, loff_t *ppos)
++{
++   printk("toggling initialized = %d\n", toggle_init);
++   return 0;
++}
++
++// Write function
++static ssize_t toggle_init_write(struct file *file, const char __user *ubuf,
++                           size_t count, loff_t *ppos)
++{
++    char buf[8];
++    long val;
++
++    if (count >= 8) {
++	pr_err("size = %lu, efault\n", count);
++        return -EFAULT;
++    }
++
++    if (copy_from_user(buf, ubuf, count))
++        return -EFAULT;
++
++    buf[count] = '\0';
++
++    if (kstrtol(buf, 10, &val) < 0)
++        return -EINVAL;
++
++    toggle_init = (int)val;
++    pr_err("toggle_initialized(W) = %d\n", toggle_init);
++    return count;
++}
++
++static const struct proc_ops toggle_fops = {
++    .proc_read  = toggle_init_read,
++    .proc_write = toggle_init_write,
++};
++
+ static int __init proc_genhd_init(void)
+ {
+ 	proc_create_seq("diskstats", 0, NULL, &diskstats_op);
+ 	proc_create_seq("partitions", 0, NULL, &partitions_op);
++	proc_create("toggle_init", 0666, NULL, &toggle_fops);
+ 	return 0;
+ }
+ module_init(proc_genhd_init);
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index c8be41d8eb24..3f9a465dce17 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1382,11 +1382,14 @@ static bool scsi_mq_lld_busy(struct request_queue *q)
+  * Block layer request completion callback. May be called from interrupt
+  * context.
+  */
++
++extern int toggle_init;
++static int requeue = 0;
+ static void scsi_complete(struct request *rq)
+ {
+ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
+ 	enum scsi_disposition disposition;
+-
++	enum scsi_disposition temp_disposition;
+ 	INIT_LIST_HEAD(&cmd->eh_entry);
+ 
+ 	atomic_inc(&cmd->device->iodone_cnt);
+@@ -1399,7 +1402,18 @@ static void scsi_complete(struct request *rq)
+ 
+ 	scsi_log_completion(cmd, disposition);
+ 
+-	switch (disposition) {
++	temp_disposition = disposition;
++
++	if (toggle_init) {
++		if (requeue) {
++			temp_disposition = ADD_TO_MLQUEUE;
++			requeue = 0;
++		} else {
++			requeue = 1;
++		}
++	}
++
++	switch (temp_disposition) {
+ 	case SUCCESS:
+ 		scsi_finish_command(cmd);
+ 		break;
+-- 
+2.43.5
+
